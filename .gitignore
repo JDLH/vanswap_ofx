@@ -1,2 +1,8 @@
 # Python project
 *.pyc
+
+# Mac OS system files
+.DS_Store
+
+# Eclipse config files
+/.settings
