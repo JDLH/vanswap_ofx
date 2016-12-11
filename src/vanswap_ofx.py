@@ -35,13 +35,14 @@ from ofxparse.ofxparse import OfxFile
 from argparse import ArgumentParser
 from argparse import RawDescriptionHelpFormatter
 
+
 __all__ = []
 __version__ = 0.1
 __date__ = '2016-12-08'
 __updated__ = '2016-12-08'
 
 DEBUG = 0
-TESTRUN = 0
+TESTRUN = 1
 PROFILE = 0
 
 class CLIError(Exception):
@@ -53,6 +54,78 @@ class CLIError(Exception):
         return self.msg
     def __unicode__(self):
         return self.msg
+    
+class PathFile(object):
+    '''PathFile: instantiate with either a fileobj or a path, get a fileobj
+    
+    PathFile handles opening a path to get a fileobj. 
+
+    (We will use a temp file pathname for examples.)
+    >>> import tempfile
+    >>> f = tempfile.NamedTemporaryFile(delete=False)
+    >>> f.write(''); f.close()
+    
+    Pass in a string or bytes array for the filename, and PathFile opens it.
+    The attribute 'fh' contains the fileobject for the opened file.
+    >>> pf = PathFile(f.name, 'r'); hasattr(pf.fh, 'read')
+    True
+    
+    The attribute 'name' contains the path name supplied to PathFile.
+    >>> pf.name == f.name
+    True
+    
+    PathFile opens the path on instantiation, and closes on destruction.
+    >>> pf.fh.closed
+    False
+    >>> t_fh = pf.fh; del(pf); t_fh.closed; del(t_fh)
+    True
+    
+    PathFile will raise the same exceptions as open(). For example, if 
+    PathFile tries to open a file for reading, and there is no file at the 
+    path, PathFile raises an IOError.
+    >>> p = f.name; os.remove(p)
+    >>> pf = PathFile(p, 'r')     # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+      ...
+    IOError: [Errno 2] No such file or directory: ...
+    
+    PathFile also accepts an open file-like object. It will use that object
+    instead of treating the parameter as a pathname to open.
+    >>> import io
+    >>> s = io.BytesIO(b'DUMMY Test file contents')
+    >>> pf = PathFile(s); pf.fh.read()
+    'DUMMY Test file contents'
+    
+    Supplying file-like objects is helpful in writing test cases. 
+    Test cases can pass a BytesIO object with test data to the PathFile object.
+    Production clients, on the other hand, can pass a path.
+        '''
+    def __init__(self, p, mode='r'):
+        self.fh = None
+        self.name = None
+        if self.is_file(p):
+            self.fh = p
+            try:
+                self.name = p.name
+            except AttributeError:
+                self.name = repr(p)
+            return
+        self.fh = open(p, mode)
+        self.name = p
+        return
+    
+    def __del__(self):
+        '''PathFile.__del__: close fileobj, if open.'''
+        if self.fh:
+            self.fh.close()
+
+    def is_file(self, p):
+        '''returns True if p is a file-like object, False otherwise
+        
+        p: an object to examine
+        '''
+        return hasattr(p, 'read') and hasattr(p, 'close')
+    
     
 class OFXRepairer(object):
     REPAIRED_EXT = '.repaired'  
@@ -147,9 +220,9 @@ class OFXRepairer(object):
 def main(argv=None): # IGNORE:C0111
     '''Command line options.
     
-    >>> main(['foo.dat'])
+    >>> print( "Exit Code: {0}".format(main(['foo.dat'])) )
     I don't work on files ending in '.dat': foo.dat.
-    
+    Exit Code: 0
     '''
 
     if argv is None:
