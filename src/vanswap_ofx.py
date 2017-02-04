@@ -27,6 +27,7 @@ modified filename.
 
 import sys
 import os.path
+import io
 import codecs
 import re
 # Danger, ofxparse.ofxparse and OfxFile are not official exports of ofxparse.
@@ -66,8 +67,8 @@ class PathFile(object):
     >>> f.write(''); f.close()
     
     Pass in a string or bytes array for the filename, and PathFile opens it.
-    The attribute 'fh' contains the fileobject for the opened file.
-    >>> pf = PathFile(f.name, 'r'); hasattr(pf.fh, 'read')
+    The attribute '_fh' contains the fileobject for the opened file.
+    >>> pf = PathFile(f.name, 'r'); hasattr(pf, 'read')
     True
     
     The attribute 'name' contains the path name supplied to PathFile.
@@ -75,16 +76,18 @@ class PathFile(object):
     True
     
     PathFile opens the path on instantiation, and closes on destruction.
-    >>> pf.fh.closed
+    >>> pf.closed
     False
-    >>> t_fh = pf.fh; del(pf); t_fh.closed; del(t_fh)
+    >>> t_fh = pf._fh; del(pf); t_fh.closed; del(t_fh)
     True
     
     PathFile will raise the same exceptions as open(). For example, if 
     PathFile tries to open a file for reading, and there is no file at the 
     path, PathFile raises an IOError.
-    >>> p = f.name; os.remove(p)
-    >>> pf = PathFile(p, 'r')     # doctest: +IGNORE_EXCEPTION_DETAIL
+    >>> p = f.name; os.remove(p)  # p is path where no file exists
+    >>> pf = PathFile(p); pf is None  # Lazy opening: pf is not yet open.
+    False
+    >>> pf.open()     # doctest: +IGNORE_EXCEPTION_DETAIL
     Traceback (most recent call last):
       ...
     IOError: [Errno 2] No such file or directory: ...
@@ -93,38 +96,62 @@ class PathFile(object):
     instead of treating the parameter as a pathname to open.
     >>> import io
     >>> s = io.BytesIO(b'DUMMY Test file contents')
-    >>> pf = PathFile(s); pf.fh.read()
+    >>> pf = PathFile(s); pf.read()
     'DUMMY Test file contents'
     
     Supplying file-like objects is helpful in writing test cases. 
     Test cases can pass a BytesIO object with test data to the PathFile object.
     Production clients, on the other hand, can pass a path.
-        '''
+    '''
+
     def __init__(self, p, mode='r'):
-        self.fh = None
+        self._fh = None
         self.name = None
-        if self.is_file(p):
-            self.fh = p
+        self._mode = mode
+        if self._is_file(p):
+            self._fh = p
             try:
                 self.name = p.name
             except AttributeError:
                 self.name = repr(p)
             return
-        self.fh = open(p, mode)
+        # self._fh = open(p, mode)
         self.name = p
         return
     
     def __del__(self):
         '''PathFile.__del__: close fileobj, if open.'''
-        if self.fh:
-            self.fh.close()
+        if self._fh:
+            self._fh.close()
 
-    def is_file(self, p):
+    def _is_file(self, p):
         '''returns True if p is a file-like object, False otherwise
         
         p: an object to examine
         '''
         return hasattr(p, 'read') and hasattr(p, 'close')
+    
+    # emulate file class's methods by passing all attribute lookups to 
+    # _fh, the underlying file object.
+    # This emulation based on class tempfile._TemporaryFileWrapper.
+    def __getattr__(self, name):
+        # Attribute lookups are delegated to the underlying file
+        # and cached for non-numeric results
+        # (i.e. methods are cached, closed and friends are not)
+        _fh = self.__dict__['_fh'] # Can't say self._fh, that would be recursive 
+        if _fh is None:
+            _fh = self._fh = io.open(self.__dict__['name'], self.__dict__['_mode'])
+        a = getattr(_fh, name)
+        if not issubclass(type(a), type(0)):
+            setattr(self, name, a)
+        return a
+
+    # The underlying __enter__ method returns the wrong object
+    # (self._fh) so override it to return the wrapper
+    def __enter__(self):
+        self._fh.__enter__()
+        return self
+
     
     
 class OFXRepairer(object):
@@ -140,15 +167,15 @@ class OFXRepairer(object):
         self.repaired_ext = repaired_ext
         self.fileobj = open(self.in_path, 'r')
         # OfxFile reads the headers, handles encoding. 
-        # Its .fh is a file object which decodes properly.
+        # Its ._fh is a file object which decodes properly.
         f = OfxFile(self.fileobj)
-        self.fh = f.fh
+        self._fh = f._fh
         self.codec_name = self.codec_name_from_ofx_headers(f.headers)
         self.out_path = self.generate_out_path(self.in_path)
 
     def __del__(self):
         '''OFXRepairer destructor: close file handles'''
-        self.fh.close()
+        self._fh.close()
         self.fileobj.close()
 
     def codec_name_from_ofx_headers(self, headers):
@@ -204,8 +231,8 @@ class OFXRepairer(object):
         with open(self.out_path,'w') as bytes_out:
             with codecs.lookup(self.codec_name).streamwriter(bytes_out) as fh_out:
                 # everything through the first <OFX> tag
-                self.fh.seek(0)
-                s = self.fh.read()
+                self._fh.seek(0)
+                s = self._fh.read()
                 m_ofx = self.RE_OFX.match(s)
                 if m_ofx and m_ofx.lastindex == 3:
                     # valid contents: process them
