@@ -152,7 +152,76 @@ class PathFile(object):
         self._fh.__enter__()
         return self
 
+class FilterInOutFiles(object):
+    '''FilterInOutFiles: opens an input and an output file for a filter.
     
+    Given an input file path, open that path for reading, 
+    generate an output path, and open that path for writing.
+    Make both path objects available as attributes.
+    
+    Intended for use with a command-line filter, which reads the
+    contents of the input file and from this writes the output file.
+    This class is independent of how the filter interprets the input
+    data or generates the output data.
+
+    >>> import os, os.path, tempfile
+    >>> p = tempfile.mkdtemp()
+    >>> f = open( os.path.join(p, 'test.txt'), 'w' )
+    >>> f.write(''); f.close()
+    >>> C = FilterInOutFiles('.out')
+    >>> fh_i, fh_o = C.open_in_out_files(f.name)
+    >>> os.path.basename(fh_o.name)
+    'test.out.txt'
+    >>> C.close()
+    >>> os.remove(f.name); os.remove( fh_o.name );
+    >>> os.rmdir(p)
+    '''
+    
+    def __init__(self, output_ext='.out'):
+        '''FilterInOutFiles(path): open path as an OFX file, prepare to repair'''
+        
+        self.output_ext = output_ext
+        self.in_path = self.in_file = None
+        self.out_path = self.out_file = None
+
+    def generate_out_path(self, path):
+        '''Generate an output file path based on given path.
+        Path: Unicode string, path to input file.
+        
+        >>> C = FilterInOutFiles('.out')
+        >>> C.generate_out_path('foo.txt')
+        'foo.out.txt'
+        '''
+
+        if path is None or path == '' \
+                    or self.output_ext is None or self.output_ext == '':
+            return path
+        
+        (root, ext) = os.path.splitext(path)
+        return root+self.output_ext+ext
+
+    IN_FLAGS = 'r'  # flags to use with io.open() when opening in_path
+    OUT_FLAGS = 'w' # flags to use with io.open() when opening out_path
+    def open_in_out_files(self, in_path):
+        '''open_in_out_files(in_path): return open inFile, outFile objects.
+        '''
+        self.in_path = in_path
+        self.out_path = self.generate_out_path(in_path)
+        self.in_file = open(self.in_path, self.IN_FLAGS)
+        self.out_file = open(self.out_path, self.OUT_FLAGS)
+        
+        return (self.in_file, self.out_file)
+
+    def close(self):
+        '''close(): close the input and output files, erase the paths
+        '''
+        if self.in_file is not None:
+            self.in_file.close()
+        self.in_file = self.in_path = None
+        if self.out_file is not None:
+            self.out_file.close()
+        self.out_file = self.out_path = None
+
     
 class OFXRepairer(object):
     REPAIRED_EXT = '.repaired'  
@@ -162,21 +231,22 @@ class OFXRepairer(object):
     def __init__(self, path, repaired_ext=REPAIRED_EXT):
         '''OFXRepairer(path): open path as an OFX file, prepare to repair'''
         
-        self.in_path = path
-        self.out_path = None
-        self.repaired_ext = repaired_ext
-        self.fileobj = open(self.in_path, 'r')
-        # OfxFile reads the headers, handles encoding. 
-        # Its ._fh is a file object which decodes properly.
-        f = OfxFile(self.fileobj)
-        self._fh = f._fh
-        self.codec_name = self.codec_name_from_ofx_headers(f.headers)
-        self.out_path = self.generate_out_path(self.in_path)
+        self.file_manager = FilterInOutFiles(repaired_ext)
+        self.in_file = self.out_file = self._fh = self.codec_name = None
+        if path is not None:
+            self.in_file, self.out_file = \
+                    self.file_manager.open_in_out_files(path)
+            # OfxFile reads the headers, handles encoding. 
+            # Its ._fh is a file object which decodes properly.
+            f = OfxFile(self.in_file)
+            self._fh = f._fh
+            self.codec_name = self.codec_name_from_ofx_headers(f.headers)
 
     def __del__(self):
         '''OFXRepairer destructor: close file handles'''
-        self._fh.close()
-        self.fileobj.close()
+        if self._fh is not None:
+            self._fh.close()
+        self.file_manager.close()
 
     def codec_name_from_ofx_headers(self, headers):
         '''From OFX headers dict, derive Python codec name
@@ -201,47 +271,75 @@ class OFXRepairer(object):
         return None
         
         
-    def generate_out_path(self, path):
-        '''Generate an output file path based on given path.
-        Path: Unicode string, path to input file.
-        '''
-        if path is None or path == '' \
-                    or self.repaired_ext is None or self.repaired_ext == '':
-            return path
-        
-        (root, ext) = os.path.splitext(path)
-        return root+self.repaired_ext+ext
-    
     # Regular expression extracting content between OFX start and end elements
     RE_OFX = re.compile(r'(?is)([^<]*<OFX>)(.*?)(</OFX>.*)')
+    
+    def split_input(self, s):
+        '''Split_input(s): split s into pre, to_repair, and post strings
+        
+        >>> r = OFXRepairer(None)
+        >>> r.split_input("foo foo <OFX>stuff stuff stuff</OFX>bar bar")
+        ('foo foo <OFX>', 'stuff stuff stuff', '</OFX>bar bar')
+        '''
+        m_ofx = self.RE_OFX.match(s)
+        if m_ofx and m_ofx.lastindex == 3:
+            # valid contents: return them
+            return m_ofx.group(1), m_ofx.group(2), m_ofx.group(3)
+        # Failed, return Nones
+        return None, None, None
+
     # Regular expression extracting STMTTRN element
     RE_STMTTRN = re.compile(r'''(?isx)(?P<pre><STMTTRN>.*?\n)
-                (?P<name_tag>\s*<NAME>)(?P<name_line>.*?\n)
-                (?P<memo_tag>\s*<MEMO>)(?P<memo_line>.*?\n)
+                (?P<name_tag>\s*<NAME>)(?P<name_line>.*?)\n
+                (?P<memo_tag>\s*<MEMO>)(?P<memo_line>.*?)
+                    (?P<conf_field>(\s*Confirmation\s\#\d+\s*)?)\n
                 (?P<post>.*?</STMTTRN>)''')
-    # Expression to repair matches to RE_STMTTRN
-    REPL = r'\g<pre>\g<name_tag>\g<memo_line>\g<memo_tag>\g<name_line>\g<post>'
     
+    # Expression to repair matches to RE_STMTTRN
+    REPL = r'\g<pre>\g<name_tag>\g<memo_line>\n' \
+           r'\g<memo_tag>\g<name_line>\g<conf_field>\n\g<post>'
+    
+    
+    def repair(self, to_repair):
+        '''repair(s): perform the repair on string s, returning repaired s
+        
+        >>> r = OFXRepairer(None)
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+<DTPOSTED>20161201000000[-8:PST]\\n\
+<NAME>Bill payment online\\n\
+<MEMO>HYDRO 8509 Confirmation #743046       \\n\
+<TRNAMT>-20.00\\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+        <DTPOSTED>20161201000000[-8:PST]
+        <NAME>HYDRO 8509
+        <MEMO>Bill payment online Confirmation #743046       
+        <TRNAMT>-20.00
+        </STMTTRN>
+                
+        '''
+        return self.RE_STMTTRN.sub(self.REPL, to_repair)
+        # note: since re.sub() has no count, it substitutes all occurrences.
+       
     def write(self):
         '''repair and write out the repaired file contents
         
         For this utility, we swap the values of the NAME and MEMO fields.
         '''
         
-        with open(self.out_path,'w') as bytes_out:
-            with codecs.lookup(self.codec_name).streamwriter(bytes_out) as fh_out:
-                # everything through the first <OFX> tag
-                self._fh.seek(0)
-                s = self._fh.read()
-                m_ofx = self.RE_OFX.match(s)
-                if m_ofx and m_ofx.lastindex == 3:
-                    # valid contents: process them
-                    fh_out.write(m_ofx.group(1)) # Through <OFX>
-                    repaired = self.RE_STMTTRN.sub(self.REPL,m_ofx.group(2))
-                    fh_out.write(repaired) # contents
-                    fh_out.write(m_ofx.group(3)) # </OFX> to end
-                else:
-                    raise CLIError('Appears to not be OFX: {0}'.format(self.in_path))
+        with codecs.lookup(self.codec_name).streamwriter(self.out_file) as fh_out:
+            # everything through the first <OFX> tag
+            self._fh.seek(0)
+            s = self._fh.read()
+            pre, to_repair, post = self.split_input(s)
+            if pre is None:
+                raise CLIError('Appears to not be OFX: {0}'.format(self.in_path))
+            else:                
+                fh_out.write(pre)
+                fh_out.write(self.do_repair(to_repair))
+                fh_out.write(post)
         
 
 def main(argv=None): # IGNORE:C0111
