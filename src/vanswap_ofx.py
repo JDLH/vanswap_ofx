@@ -224,29 +224,30 @@ class FilterInOutFiles(object):
 
     
 class OFXRepairer(object):
-    REPAIRED_EXT = '.repaired'  
-    # repaired files have this extra extension before their extension
-    # e.g. foo.ofx after repair is written to foo.repaired.ofx
-
-    def __init__(self, path, repaired_ext=REPAIRED_EXT):
-        '''OFXRepairer(path): open path as an OFX file, prepare to repair'''
+    def __init__(self, in_file=None, out_file=None):
+        '''OFXRepairer(in_file, out_file): prepare to repair OFX
         
-        self.file_manager = FilterInOutFiles(repaired_ext)
-        self.in_file = self.out_file = self._fh = self.codec_name = None
-        if path is not None:
-            self.in_file, self.out_file = \
-                    self.file_manager.open_in_out_files(path)
-            # OfxFile reads the headers, handles encoding. 
+        Instantiate with file objects for input and output to perform
+        a repair. Caller must open and close file objects.
+        
+        You can instantiate without file parameters in test fixtures,
+        in order to exercise the methods. 
+        '''
+        
+        self.out_file = out_file
+        self.in_file = self.codec_name = None
+        if in_file is not None:
+            # OfxFile reads the headers, and it handles encoding. 
             # Its ._fh is a file object which decodes properly.
-            f = OfxFile(self.in_file)
-            self._fh = f._fh
+            f = OfxFile(in_file)
+            self.in_file = f._fh
+            self.in_file.seek(0)  # Later, we reread from beginning
             self.codec_name = self.codec_name_from_ofx_headers(f.headers)
 
     def __del__(self):
         '''OFXRepairer destructor: close file handles'''
-        if self._fh is not None:
-            self._fh.close()
-        self.file_manager.close()
+        if self.in_file is not None:
+            self.in_file.close()
 
     def codec_name_from_ofx_headers(self, headers):
         '''From OFX headers dict, derive Python codec name
@@ -276,11 +277,22 @@ class OFXRepairer(object):
     
     def split_input(self, s):
         '''Split_input(s): split s into pre, to_repair, and post strings
-        
+
+        RE_OFX is a regular expression which recognises three groups:
+        pre-target, target, and post-target.  
+        An <OFX> element ends the pre-target. An </OFX> starts the post-target.
+        Given a string that matches this RE, return the three parts.
         >>> r = OFXRepairer(None)
         >>> r.split_input("foo foo <OFX>stuff stuff stuff</OFX>bar bar")
         ('foo foo <OFX>', 'stuff stuff stuff', '</OFX>bar bar')
+        
+        Given a string that does not match this RE, return three Nones.
+        >>> r.split_input("Has <OFX> element, but does not fully match.")
+        (None, None, None)
+        >>> r.split_input("Does not match at all.")
+        (None, None, None)
         '''
+
         m_ofx = self.RE_OFX.match(s)
         if m_ofx and m_ofx.lastindex == 3:
             # valid contents: return them
@@ -303,6 +315,13 @@ class OFXRepairer(object):
     def repair(self, to_repair):
         '''repair(s): perform the repair on string s, returning repaired s
         
+        Perform a repair on string s. 
+        The incorrect files have text after the <NAME> which belongs in
+        the <MEMO>. The text in <MEMO> has a leading part which belongs
+        in the <NAME>. However it may also have a trailing part of the
+        form "Confirmation #1234". This should remain in the <MEMO>.
+        
+        # This is the desired repair.
         >>> r = OFXRepairer(None)
         >>> print(r.repair("""\
 <STMTTRN>\\n\
@@ -319,6 +338,33 @@ class OFXRepairer(object):
         <TRNAMT>-20.00
         </STMTTRN>
                 
+        Repair of a transaction with no Confirmation part.
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+<DTPOSTED>20161202000000[-8:PST]\\n\
+<NAME>Bill payment online \\n\
+<MEMO>HYDRO 8511       \\n\
+<TRNAMT>-20.00\\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+        <DTPOSTED>20161202000000[-8:PST]
+        <NAME>HYDRO 8511       
+        <MEMO>Bill payment online 
+        <TRNAMT>-20.00
+        </STMTTRN>
+                
+        Transactions missing either <NAME> and <MEMO> field are not changed.
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+<TRNAMT>-10.00\\n\
+<DTPOSTED>20161203000000[-8:PST]\\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+        <TRNAMT>-10.00
+        <DTPOSTED>20161203000000[-8:PST]
+        </STMTTRN>
         '''
         return self.RE_STMTTRN.sub(self.REPL, to_repair)
         # note: since re.sub() has no count, it substitutes all occurrences.
@@ -326,16 +372,15 @@ class OFXRepairer(object):
     def write(self):
         '''repair and write out the repaired file contents
         
-        For this utility, we swap the values of the NAME and MEMO fields.
         '''
+        if self.out_file is None:
+            return
         
         with codecs.lookup(self.codec_name).streamwriter(self.out_file) as fh_out:
-            # everything through the first <OFX> tag
-            self._fh.seek(0)
-            s = self._fh.read()
+            s = self.in_file.read()
             pre, to_repair, post = self.split_input(s)
             if pre is None:
-                raise CLIError('Appears to not be OFX: {0}'.format(self.in_path))
+                raise CLIError('Appears to not be OFX: {0}'.format(self.in_file.name))
             else:                
                 fh_out.write(pre)
                 fh_out.write(self.do_repair(to_repair))
@@ -344,10 +389,12 @@ class OFXRepairer(object):
 
 def main(argv=None): # IGNORE:C0111
     '''Command line options.
-    
-    >>> print( "Exit Code: {0}".format(main(['foo.dat'])) )
+
+    Only works on files with specific extensions.
+    However, the exit code is 0, not an error exit code.
+    >>> main(['foo.dat'])
     I don't work on files ending in '.dat': foo.dat.
-    Exit Code: 0
+    0
     '''
 
     if argv is None:
@@ -401,17 +448,26 @@ USAGE
 #                 print("Recursive mode off")
             print("Repairing {0} files: {1}".format(len(paths), paths))
 
+        file_manager = FilterInOutFiles('.repaired')
+        # repaired files have this extra extension before their extension
+        # e.g. foo.ofx after repair is written to foo.repaired.ofx
+
         for inpath in paths:
             (_,ext) = os.path.splitext(inpath)
             if ext.lower() in ['.ofx', '.qfx']:
                 if verbose > 0:
                     print("Repairing {0}...".format(inpath))
-                r = OFXRepairer(inpath)
+                in_file, out_file = file_manager.open_in_out_files(inpath)
+
+                r = OFXRepairer(in_file, out_file)
                 r.write()
                 print("Repaired {0}.".format(inpath))
             else:
                 print("I don't work on files ending in '{0}': {1}.".format(ext, inpath))
+            file_manager.close()
+
         return 0
+    
     except KeyboardInterrupt:
         ### handle keyboard interrupt ###
         return 0
