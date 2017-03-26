@@ -38,12 +38,12 @@ from argparse import RawDescriptionHelpFormatter
 
 
 __all__ = []
-__version__ = 0.1
-__date__ = '2016-12-08'
-__updated__ = '2016-12-08'
+__version__ = 0.5
+__date__ = '2017-02-11'
+__updated__ = __date__
 
 DEBUG = 0
-TESTRUN = 1
+TESTRUN = 0
 PROFILE = 0
 
 class CLIError(Exception):
@@ -225,13 +225,16 @@ class FilterInOutFiles(object):
     
 class OFXRepairer(object):
     def __init__(self, in_file=None, out_file=None):
-        '''OFXRepairer(in_file, out_file): prepare to repair OFX
+        r'''OFXRepairer(in_file, out_file): prepare to repair OFX
         
         Instantiate with file objects for input and output to perform
         a repair. Caller must open and close file objects.
         
         You can instantiate without file parameters in test fixtures,
         in order to exercise the methods. 
+        
+        # Test a complete file example
+        >>> import io
         '''
         
         self.out_file = out_file
@@ -240,7 +243,7 @@ class OFXRepairer(object):
             # OfxFile reads the headers, and it handles encoding. 
             # Its ._fh is a file object which decodes properly.
             f = OfxFile(in_file)
-            self.in_file = f._fh
+            self.in_file = f.fh
             self.in_file.seek(0)  # Later, we reread from beginning
             self.codec_name = self.codec_name_from_ofx_headers(f.headers)
 
@@ -301,21 +304,20 @@ class OFXRepairer(object):
         return None, None, None
 
     # Regular expression extracting STMTTRN element
-    RE_STMTTRN = re.compile(r'''(?isx)(?P<pre><STMTTRN>.*?\n)
+    RE_STMTTRN = re.compile(r'''(?ix)
+                (?P<pre><STMTTRN>.*\n(.*\n)*?)
+                # Require both <NAME> and <MEMO> if we are to repair
                 (?P<name_tag>\s*<NAME>)(?P<name_line>.*?)\n
                 (?P<memo_tag>\s*<MEMO>)(?P<memo_line>.*?)
-                    (?P<conf_field>(\s*Confirmation\s\#\d+\s*)?)\n
-                (?P<post>.*?</STMTTRN>)''')
+                      (?P<conf_field>(\s*Confirmation\s\#\d+\s*)?)\n
+                (?P<post>(.*?\n)*?</STMTTRN>)''')
     
-    # Expression to repair matches to RE_STMTTRN
-    REPL = r'\g<pre>\g<name_tag>\g<memo_line>\n' \
-           r'\g<memo_tag>\g<name_line>\g<conf_field>\n\g<post>'
     
     
     def repair(self, to_repair):
-        '''repair(s): perform the repair on string s, returning repaired s
+        '''repair(to_repair): perform the repair on string s, returning repaired s
         
-        Perform a repair on string s. 
+        Perform a repair on string to_repair. 
         The incorrect files have text after the <NAME> which belongs in
         the <MEMO>. The text in <MEMO> has a leading part which belongs
         in the <NAME>. However it may also have a trailing part of the
@@ -338,6 +340,23 @@ class OFXRepairer(object):
         <TRNAMT>-20.00
         </STMTTRN>
                 
+        # Should also work if <MEMO> is the final element in <STMTTRN>
+        >>> r = OFXRepairer(None)
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+<DTPOSTED>20161205000000[-8:PST]\\n\
+<TRNAMT>-20.00\\n\
+<NAME>Bill payment online\\n\
+<MEMO>HYDRO 8509 Confirmation #743046       \\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+        <DTPOSTED>20161205000000[-8:PST]
+        <TRNAMT>-20.00
+        <NAME>HYDRO 8509
+        <MEMO>Bill payment online Confirmation #743046       
+        </STMTTRN>
+                
         Repair of a transaction with no Confirmation part.
         >>> print(r.repair("""\
 <STMTTRN>\\n\
@@ -354,6 +373,22 @@ class OFXRepairer(object):
         <TRNAMT>-20.00
         </STMTTRN>
                 
+        Some transactions have only a <NAME>, no <MEMO>. Those are unchanged.
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+  <TRNTYPE>CREDIT\\n\
+  <DTPOSTED>20161230100000[-8:PST]\\n\
+  <TRNAMT>1.02\\n\
+  <NAME>Interest credited to account\\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+          <TRNTYPE>CREDIT
+          <DTPOSTED>20161230100000[-8:PST]
+          <TRNAMT>1.02
+          <NAME>Interest credited to account
+        </STMTTRN>
+
         Transactions missing either <NAME> and <MEMO> field are not changed.
         >>> print(r.repair("""\
 <STMTTRN>\\n\
@@ -365,10 +400,48 @@ class OFXRepairer(object):
         <TRNAMT>-10.00
         <DTPOSTED>20161203000000[-8:PST]
         </STMTTRN>
+
+        This case confused the code: a transaction with only a <NAME>
+        element, followed by one with <NAME> and <MEMO>. The first 
+        must not change, the second changes only its own <NAME> element,
+        it doesn't reach back to the first transaction's <NAME>.
+        >>> print(r.repair("""\
+<STMTTRN>\\n\
+  <NAME>Interest credited to account\\n\
+</STMTTRN>\\n\
+<STMTTRN>\\n\
+  <NAME>Funds transfer online\\n\
+  <MEMO>from Pay As You Go Chequing\\n\
+</STMTTRN>\
+"""))
+        <STMTTRN>
+          <NAME>Interest credited to account
+        </STMTTRN>
+        <STMTTRN>
+          <NAME>from Pay As You Go Chequing
+          <MEMO>Funds transfer online
+        </STMTTRN>
+
         '''
-        return self.RE_STMTTRN.sub(self.REPL, to_repair)
+        
+
+        def repl(m):
+            """Safely generate a replace string from a match object
+            
+            We can't use re.sub() with named groups, because Python before 3.4
+            throws "unmatched group" errors instead of substituting ''.
+            """
+            g = m.groupdict(default='')
+            new_name = g['name_tag']+g['memo_line']+'\n' \
+                            if g['name_tag'] else ''
+            new_memo = g['memo_tag']+g['name_line']+g['conf_field']+'\n' \
+                            if g['memo_tag'] else ''
+            return g['pre'] + new_name + new_memo + g['post']
+
+        return self.RE_STMTTRN.sub(repl, to_repair)
         # note: since re.sub() has no count, it substitutes all occurrences.
        
+
     def write(self):
         '''repair and write out the repaired file contents
         
@@ -383,7 +456,7 @@ class OFXRepairer(object):
                 raise CLIError('Appears to not be OFX: {0}'.format(self.in_file.name))
             else:                
                 fh_out.write(pre)
-                fh_out.write(self.do_repair(to_repair))
+                fh_out.write(self.repair(to_repair))
                 fh_out.write(post)
         
 
@@ -392,7 +465,8 @@ def main(argv=None): # IGNORE:C0111
 
     Only works on files with specific extensions.
     However, the exit code is 0, not an error exit code.
-    >>> main(['foo.dat'])
+    >>> sys.argv[1:] = ['foo.dat']
+    >>> main()
     I don't work on files ending in '.dat': foo.dat.
     0
     '''
