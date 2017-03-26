@@ -39,7 +39,7 @@ from argparse import RawDescriptionHelpFormatter
 
 __all__ = []
 __version__ = 0.5
-__date__ = '2017-02-11'
+__date__ = '2017-03-25'
 __updated__ = __date__
 
 DEBUG = 0
@@ -234,7 +234,41 @@ class OFXRepairer(object):
         in order to exercise the methods. 
         
         # Test a complete file example
-        >>> import io
+        >>> import io, tempfile, os
+        >>> in_file = io.BytesIO( u"""OFXHEADER:100
+        ... DATA:OFXSGML
+        ... VERSION:102
+        ... SECURITY:TYPE1
+        ... ENCODING:USASCII
+        ... CHARSET:1252
+        ... 
+        ... <OFX>
+        ...  <BANKMSGSRSV1>
+        ...   <STMTTRNRS>
+        ...    <STMTRS>
+        ...      <STMTTRN>
+        ...       <TRNTYPE>DEBIT
+        ...       <DTPOSTED>20170101000000[-8:PST]
+        ...       <TRNAMT>-12.34
+        ...       <FITID>25.030001    1790116941000
+        ...       <NAME>payment
+        ...       <MEMO>VISA Confirmation #881665       
+        ...      </STMTTRN>
+        ...    </STMTRS>
+        ...   </STMTTRNRS>
+        ...  </BANKMSGSRSV1>
+        ... </OFX>
+        ... """.encode('cp1252'))
+        >>> try:
+        ...     (out_fd, out_path) = tempfile.mkstemp(); out_file = os.fdopen(out_fd, 'w')
+        ...     r = OFXRepairer(in_file, out_file); r.write()
+        ...     out_file = io.open(out_path, 'rb'); bb = out_file.readlines();
+        ... finally:
+        ...     os.remove(out_path)
+        >>> bb[16].strip()
+        '<NAME>VISA'
+        >>> bb[17].strip()
+        '<MEMO>payment Confirmation #881665'
         '''
         
         self.out_file = out_file
@@ -279,7 +313,7 @@ class OFXRepairer(object):
     RE_OFX = re.compile(r'(?is)([^<]*<OFX>)(.*?)(</OFX>.*)')
     
     def split_input(self, s):
-        '''Split_input(s): split s into pre, to_repair, and post strings
+        r'''Split_input(s): split string s into pre, to_repair, and post strings
 
         RE_OFX is a regular expression which recognises three groups:
         pre-target, target, and post-target.  
@@ -294,6 +328,62 @@ class OFXRepairer(object):
         (None, None, None)
         >>> r.split_input("Does not match at all.")
         (None, None, None)
+        
+        A full-file example:
+        >>> (pre, to_repair, post) = r.split_input("""OFXHEADER:100
+        ... DATA:OFXSGML
+        ... VERSION:102
+        ... SECURITY:TYPE1
+        ... ENCODING:USASCII
+        ... CHARSET:1252
+        ... 
+        ... <OFX>
+        ...  <BANKMSGSRSV1>
+        ...   <STMTTRNRS>
+        ...    <STMTRS>
+        ...      <STMTTRN>
+        ...       <TRNTYPE>DEBIT
+        ...       <DTPOSTED>20170101000000[-8:PST]
+        ...       <TRNAMT>-12.34
+        ...       <FITID>25.030001    1790116941000
+        ...       <NAME>payment
+        ...       <MEMO>VISA Confirmation #881665       
+        ...      </STMTTRN>
+        ...    </STMTRS>
+        ...   </STMTTRNRS>
+        ...  </BANKMSGSRSV1>
+        ... </OFX>
+        ... """)
+        >>> print(pre)
+        OFXHEADER:100
+        DATA:OFXSGML
+        VERSION:102
+        SECURITY:TYPE1
+        ENCODING:USASCII
+        CHARSET:1252
+        <BLANKLINE>
+        <OFX>
+        >>> print(to_repair)
+        <BLANKLINE>
+         <BANKMSGSRSV1>
+          <STMTTRNRS>
+           <STMTRS>
+             <STMTTRN>
+              <TRNTYPE>DEBIT
+              <DTPOSTED>20170101000000[-8:PST]
+              <TRNAMT>-12.34
+              <FITID>25.030001    1790116941000
+              <NAME>payment
+              <MEMO>VISA Confirmation #881665       
+             </STMTTRN>
+           </STMTRS>
+          </STMTTRNRS>
+         </BANKMSGSRSV1>
+        <BLANKLINE>
+        >>> print(post)
+        </OFX>
+        <BLANKLINE>
+
         '''
 
         m_ofx = self.RE_OFX.match(s)
@@ -303,19 +393,18 @@ class OFXRepairer(object):
         # Failed, return Nones
         return None, None, None
 
+
     # Regular expression extracting STMTTRN element
     RE_STMTTRN = re.compile(r'''(?ix)
-                (?P<pre><STMTTRN>.*\n(.*\n)*?)
+                (?P<pre><STMTTRN>\s*\n(.*\n)*?)
                 # Require both <NAME> and <MEMO> if we are to repair
                 (?P<name_tag>\s*<NAME>)(?P<name_line>.*?)\n
                 (?P<memo_tag>\s*<MEMO>)(?P<memo_line>.*?)
                       (?P<conf_field>(\s*Confirmation\s\#\d+\s*)?)\n
-                (?P<post>(.*?\n)*?</STMTTRN>)''')
-    
-    
+                (?P<post>(.*?\n)*?\s*</STMTTRN>)''')
     
     def repair(self, to_repair):
-        '''repair(to_repair): perform the repair on string s, returning repaired s
+        r'''repair(to_repair): perform the repair on string s, returning repaired s
         
         Perform a repair on string to_repair. 
         The incorrect files have text after the <NAME> which belongs in
@@ -325,14 +414,12 @@ class OFXRepairer(object):
         
         # This is the desired repair.
         >>> r = OFXRepairer(None)
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-<DTPOSTED>20161201000000[-8:PST]\\n\
-<NAME>Bill payment online\\n\
-<MEMO>HYDRO 8509 Confirmation #743046       \\n\
-<TRNAMT>-20.00\\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ... <DTPOSTED>20161201000000[-8:PST]
+        ... <NAME>Bill payment online
+        ... <MEMO>HYDRO 8509 Confirmation #743046       
+        ... <TRNAMT>-20.00
+        ... </STMTTRN>"""))
         <STMTTRN>
         <DTPOSTED>20161201000000[-8:PST]
         <NAME>HYDRO 8509
@@ -342,14 +429,12 @@ class OFXRepairer(object):
                 
         # Should also work if <MEMO> is the final element in <STMTTRN>
         >>> r = OFXRepairer(None)
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-<DTPOSTED>20161205000000[-8:PST]\\n\
-<TRNAMT>-20.00\\n\
-<NAME>Bill payment online\\n\
-<MEMO>HYDRO 8509 Confirmation #743046       \\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ... <DTPOSTED>20161205000000[-8:PST]
+        ... <TRNAMT>-20.00
+        ... <NAME>Bill payment online
+        ... <MEMO>HYDRO 8509 Confirmation #743046       
+        ... </STMTTRN>"""))
         <STMTTRN>
         <DTPOSTED>20161205000000[-8:PST]
         <TRNAMT>-20.00
@@ -358,14 +443,12 @@ class OFXRepairer(object):
         </STMTTRN>
                 
         Repair of a transaction with no Confirmation part.
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-<DTPOSTED>20161202000000[-8:PST]\\n\
-<NAME>Bill payment online \\n\
-<MEMO>HYDRO 8511       \\n\
-<TRNAMT>-20.00\\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ... <DTPOSTED>20161202000000[-8:PST]
+        ... <NAME>Bill payment online 
+        ... <MEMO>HYDRO 8511       
+        ... <TRNAMT>-20.00
+        ... </STMTTRN>"""))
         <STMTTRN>
         <DTPOSTED>20161202000000[-8:PST]
         <NAME>HYDRO 8511       
@@ -374,14 +457,12 @@ class OFXRepairer(object):
         </STMTTRN>
                 
         Some transactions have only a <NAME>, no <MEMO>. Those are unchanged.
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-  <TRNTYPE>CREDIT\\n\
-  <DTPOSTED>20161230100000[-8:PST]\\n\
-  <TRNAMT>1.02\\n\
-  <NAME>Interest credited to account\\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ...   <TRNTYPE>CREDIT
+        ...   <DTPOSTED>20161230100000[-8:PST]
+        ...   <TRNAMT>1.02
+        ...   <NAME>Interest credited to account
+        ... </STMTTRN>"""))
         <STMTTRN>
           <TRNTYPE>CREDIT
           <DTPOSTED>20161230100000[-8:PST]
@@ -390,12 +471,10 @@ class OFXRepairer(object):
         </STMTTRN>
 
         Transactions missing either <NAME> and <MEMO> field are not changed.
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-<TRNAMT>-10.00\\n\
-<DTPOSTED>20161203000000[-8:PST]\\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ... <TRNAMT>-10.00
+        ... <DTPOSTED>20161203000000[-8:PST]
+        ... </STMTTRN>"""))
         <STMTTRN>
         <TRNAMT>-10.00
         <DTPOSTED>20161203000000[-8:PST]
@@ -405,15 +484,13 @@ class OFXRepairer(object):
         element, followed by one with <NAME> and <MEMO>. The first 
         must not change, the second changes only its own <NAME> element,
         it doesn't reach back to the first transaction's <NAME>.
-        >>> print(r.repair("""\
-<STMTTRN>\\n\
-  <NAME>Interest credited to account\\n\
-</STMTTRN>\\n\
-<STMTTRN>\\n\
-  <NAME>Funds transfer online\\n\
-  <MEMO>from Pay As You Go Chequing\\n\
-</STMTTRN>\
-"""))
+        >>> print(r.repair("""<STMTTRN>
+        ...   <NAME>Interest credited to account
+        ... </STMTTRN>
+        ... <STMTTRN>
+        ...   <NAME>Funds transfer online
+        ...   <MEMO>from Pay As You Go Chequing
+        ... </STMTTRN>"""))
         <STMTTRN>
           <NAME>Interest credited to account
         </STMTTRN>
@@ -421,9 +498,54 @@ class OFXRepairer(object):
           <NAME>from Pay As You Go Chequing
           <MEMO>Funds transfer online
         </STMTTRN>
-
-        '''
         
+        This case confused the code: whitespace after opening tag 
+        or before closing tag:
+        >>> print(r.repair("""     <STMTTRN>  
+        ...       <NAME>payment
+        ...       <MEMO>VISA Confirmation #881665       
+        ...      </STMTTRN>"""))
+             <STMTTRN>  
+              <NAME>VISA
+              <MEMO>payment Confirmation #881665       
+             </STMTTRN>
+
+        The transaction part of the full example from __init__:
+        >>> print(r.repair("""
+        ...  <BANKMSGSRSV1>
+        ...   <STMTTRNRS>
+        ...    <STMTRS>
+        ...      <STMTTRN>
+        ...       <TRNTYPE>DEBIT
+        ...       <DTPOSTED>20170101000000[-8:PST]
+        ...       <TRNAMT>-12.34
+        ...       <FITID>25.030001    1790116941000
+        ...       <NAME>payment
+        ...       <MEMO>VISA Confirmation #881665       
+        ...      </STMTTRN>
+        ...    </STMTRS>
+        ...   </STMTTRNRS>
+        ...  </BANKMSGSRSV1>
+        ... """))
+        <BLANKLINE>
+         <BANKMSGSRSV1>
+          <STMTTRNRS>
+           <STMTRS>
+             <STMTTRN>
+              <TRNTYPE>DEBIT
+              <DTPOSTED>20170101000000[-8:PST]
+              <TRNAMT>-12.34
+              <FITID>25.030001    1790116941000
+              <NAME>VISA
+              <MEMO>payment Confirmation #881665       
+             </STMTTRN>
+           </STMTRS>
+          </STMTTRNRS>
+         </BANKMSGSRSV1>
+        <BLANKLINE>
+        
+        End of tests.
+        '''
 
         def repl(m):
             """Safely generate a replace string from a match object
