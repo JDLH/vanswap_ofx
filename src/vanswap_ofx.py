@@ -3,21 +3,13 @@
 '''
 vanswap_ofx -- swap NAME and MEMO fields in OFX files 
 
-vanswap_ofx is a utility to repair OFX files by swapping the NAME 
-and MEMO fields. It works around a problem with OFX files created 
-by my credit union after a system upgrade in 2016. They generated OFX
-files with the NAME string in the MEMO field, and vice versa. This 
-utility repairs the OFX file by reading it in, switching the values
-of NAME and MEMO in each transaction, and writing the file out to 
-a different filename.
-
 It defines a class OFXRepairer, which does the work of parsing the
 OFX file, performing the repair, and writing out the file with a 
 modified filename.
 
 @author:     Jim DeLaHunt
 
-@copyright:  Main program in the public domain. Some modules copyright their authors.
+@copyright:  Main program is granted to the public domain. Some modules are copyright by their authors.
 
 @license:    Public domain, with components MIT licenced.
 
@@ -173,6 +165,13 @@ class FilterInOutFiles(object):
     >>> os.path.basename(fh_o.name)
     'test.out.txt'
     >>> C.close()
+    
+    If there is already a file at the output path, raise an OSError 
+    exception, with errno.EEXIST .
+    >>> fh_i, fh_o = C.open_in_out_files(f.name)     # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+      ...
+    OSError: [Errno 17] File exists: ...
     >>> os.remove(f.name); os.remove( fh_o.name );
     >>> os.rmdir(p)
     '''
@@ -200,14 +199,20 @@ class FilterInOutFiles(object):
         (root, ext) = os.path.splitext(path)
         return root+self.output_ext+ext
 
-    IN_FLAGS = 'r'  # flags to use with io.open() when opening in_path
-    OUT_FLAGS = 'w' # flags to use with io.open() when opening out_path
+    IN_FLAGS = 'rb'  # flags to use with open() when opening in_path
+    OUT_O_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL # flags to use with os.open() when opening out_path
+    OUT_FLAGS = 'wb' # flags to use with open() when opening out_path
     def open_in_out_files(self, in_path):
         '''open_in_out_files(in_path): return open inFile, outFile objects.
         '''
         self.in_path = in_path
         self.out_path = self.generate_out_path(in_path)
         self.in_file = open(self.in_path, self.IN_FLAGS)
+        # Crude check to prevent overwriting. os.open(path, os.O_CREAT | os.O_EXCL)
+        # is a more reliable way, but leaves out_file.name not set to the path.
+        if os.path.exists(self.out_path):
+            import errno
+            raise OSError(errno.EEXIST, 'File exists', self.out_path)
         self.out_file = open(self.out_path, self.OUT_FLAGS)
         
         return (self.in_file, self.out_file)
@@ -589,8 +594,33 @@ def main(argv=None): # IGNORE:C0111
     However, the exit code is 0, not an error exit code.
     >>> sys.argv[1:] = ['foo.dat']
     >>> main()
+    vanswap_ofx.py: vanswap_ofx -- swap NAME and MEMO fields in OFX files 
+    <BLANKLINE>
     I don't work on files ending in '.dat': foo.dat.
     0
+    
+    If the input file doesn't exist, it prints an error message and continues.
+    >>> import os, os.path, tempfile
+    >>> p = tempfile.mkdtemp()
+    >>> sys.argv[1:] = [ os.path.join(p, 'nonexistent.ofx') ]
+    >>> main()        # doctest: +ELLIPSIS
+    vanswap_ofx.py: vanswap_ofx -- swap NAME and MEMO fields in OFX files 
+    <BLANKLINE>
+    SORRY: File '...nonexistent.ofx' doesn't appear to exist.
+    0
+
+    If the output file exists, it prints an error message and continues.
+    >>> f1 = open( os.path.join(p, 'existing.ofx'), 'w' ); f1.write(''); f1.close()
+    >>> f2 = open( os.path.join(p, 'existing.repaired.ofx'), 'w' ); f2.write(''); f2.close()
+    >>> sys.argv[1:] = [ f1.name ]
+    >>> main()        # doctest: +ELLIPSIS
+    vanswap_ofx.py: vanswap_ofx -- swap NAME and MEMO fields in OFX files 
+    <BLANKLINE>
+    SORRY: Output file '...existing.repaired.ofx' already exists, so unable to repair '...existing.ofx'.
+    0
+
+    >>> os.remove(f1.name); os.remove( f2.name );
+    >>> os.rmdir(p)
     '''
 
     if argv is None:
@@ -605,12 +635,24 @@ def main(argv=None): # IGNORE:C0111
     program_shortdesc = __import__('__main__').__doc__.split("\n")[1]
     program_license = '''%s
 
-  Created by Jim DeLaHunt on %s.
-  Main program in the public domain. Some modules copyright their authors,
-  and released under the MIT licence.
+vanswap_ofx is a utility to repair OFX files by swapping the NAME 
+and MEMO fields. It works around a problem with OFX files created 
+by my credit union after a system upgrade in 2016. They generated OFX
+files with the NAME string in the MEMO field, and vice versa. This 
+utility repairs the OFX file by reading it in, and switching the values
+of NAME and MEMO in each transaction. If there is a confirmation number 
+in the MEMO field, it stays in the MEMO field. Then it writes the 
+repaired content out to a sister file, with a ".repaired" subextension, 
+in the same directory. 
 
-  Distributed on an "AS IS" basis without warranties
-  or conditions of any kind, either express or implied.
+e.g. the command: vanswap.py statements/transactions_201610.ofx
+writes repaired content to   statements/transactions_201610.repaired.ofx
+
+Updated by Jim DeLaHunt on %s.
+Main program is granted to the public domain. Some modules are copyright 
+by their authors, and released under the MIT licence.
+Distributed on an "AS IS" basis without warranties
+or conditions of any kind, either express or implied.
 
 USAGE
 ''' % (program_shortdesc, str(__date__))
@@ -635,6 +677,8 @@ USAGE
         # recurse = args.recurse
         # inpat = args.include
         # expat = args.exclude
+        
+        print("{0}: {1}\n".format(program_name, program_shortdesc))
 
         if verbose > 0:
             print("Verbose mode on")
@@ -653,11 +697,21 @@ USAGE
             if ext.lower() in ['.ofx', '.qfx']:
                 if verbose > 0:
                     print("Repairing {0}...".format(inpath))
-                in_file, out_file = file_manager.open_in_out_files(inpath)
-
+                try:
+                    in_file, out_file = file_manager.open_in_out_files(inpath)
+                except (IOError, OSError), e:
+                    import errno
+                    if e.errno == errno.ENOENT:
+                        print("SORRY: File '{0}' doesn't appear to exist.".format(e.filename))                        
+                    elif e.errno == errno.EEXIST:
+                        print("SORRY: Output file '{1}' already exists, so unable to repair '{0}'.".format(inpath, e.filename))
+                    else:
+                        print("SORRY: Unable to repair '{0}', because exception '{1}' occurred.".format(inpath, e))
+                    break # give up in inpath, go on to next
+                
                 r = OFXRepairer(in_file, out_file)
                 r.write()
-                print("Repaired {0}.".format(inpath))
+                print("Copy of '{0}' repaired, in '{1}'.".format(inpath, out_file.name))
             else:
                 print("I don't work on files ending in '{0}': {1}.".format(ext, inpath))
             file_manager.close()
@@ -683,6 +737,7 @@ if __name__ == "__main__":
     if TESTRUN:
         import doctest
         doctest.testmod()
+        sys.exit(0)
     if PROFILE:
         import cProfile
         import pstats
